@@ -371,7 +371,7 @@ export type PythonCtx = {
 
 export interface JinjaEngine {
     loadTemplate(templateName: string, templateContent: string): void;
-    renderTemplate(templateName: string, context: unknown, pythonContext: Record<string, any> | null): string;
+    renderTemplate(templateName: string, context: unknown, pythonContext: Record<string, any> | null): Promise<string>;
 }
 
 export class NativeInstance {

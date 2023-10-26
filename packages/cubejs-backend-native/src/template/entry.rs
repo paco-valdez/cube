@@ -5,8 +5,10 @@ use log::trace;
 use minijinja as mj;
 use neon::context::Context;
 use neon::prelude::*;
+use neon::types::Deferred;
 use std::cell::RefCell;
 use std::error::Error;
+use tokio::sync::mpsc;
 
 #[cfg(feature = "python")]
 use pyo3::{exceptions::PyNotImplementedError, prelude::*, types::PyTuple, AsPyPointer};
@@ -65,13 +67,99 @@ impl<'a> NeonMiniJinjaContext for FunctionContext<'a> {
     }
 }
 
+enum JinjaEngineWorkerJob {
+    Render {
+        template_name: String,
+        ctx: minijinja::value::Value,
+        deferred: Deferred,
+    },
+}
+
+struct JinjaEngineWorker<'a> {
+    id: usize,
+    version: usize,
+    inner: mj::Environment<'a>,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+impl<'a> JinjaEngineWorker<'a> {
+    fn new(
+        id: usize,
+        version: usize,
+        env: mj::Environment<'a>,
+        js_channel: neon::event::Channel,
+        mut receiver: tokio::sync::mpsc::Receiver<JinjaEngineWorkerJob>,
+    ) -> Self {
+        let thread = std::thread::spawn(move || -> () {
+            loop {
+                if let Some(job) = receiver.blocking_recv() {
+                    match job {
+                        JinjaEngineWorkerJob::Render { template_name, ctx, deferred } => {
+                            deferred.settle_with(
+                                &js_channel,
+                                move |mut cx| -> NeonResult<Handle<JsString>> {
+                                    Ok(cx.string("kek"))
+                                },
+                            );
+                        }
+                    }
+                } else {
+                    trace!("Closing jinja thread: {:?}", std::thread::current().id());
+
+                    return;
+                }
+            }
+        });
+
+        Self {
+            id,
+            version,
+            inner: Default::default(),
+            _thread: thread,
+        }
+    }
+}
+
 struct JinjaEngine {
+    env_version: usize,
     inner: mj::Environment<'static>,
+    workers_rx: Option<tokio::sync::mpsc::Sender<JinjaEngineWorkerJob>>,
+    workers: Vec<JinjaEngineWorker<'static>>,
+    js_channel: neon::event::Channel,
 }
 
 impl Finalize for JinjaEngine {}
 
 impl JinjaEngine {
+    fn render(&mut self, job: JinjaEngineWorkerJob) {
+        let scheduling_result = self
+            .get_workers_scheduler()
+            .blocking_send(job);
+
+        if let Err(err) = scheduling_result {
+            match err {
+                tokio::sync::mpsc::error::SendError(_) => {
+
+                }
+            };
+        };
+    }
+
+    fn get_workers_scheduler(&mut self) -> &mpsc::Sender<JinjaEngineWorkerJob> {
+        if self.workers.is_empty() {
+            let (sender, receiver) = tokio::sync::mpsc::channel::<JinjaEngineWorkerJob>(10);
+
+            self.workers
+                .push(JinjaEngineWorker::new(1, 1, self.inner.clone(),self.js_channel.clone(), receiver));
+
+            self.workers_rx = Some(sender);
+            &self.workers_rx.as_ref().unwrap()
+        } else {
+            self.workers.first().expect("Worker should exist");
+            self.workers_rx.as_ref().unwrap()
+        }
+    }
+
     fn new(cx: &mut FunctionContext) -> NeonResult<Self> {
         let options = cx.argument::<JsObject>(0)?;
 
@@ -177,14 +265,20 @@ impl JinjaEngine {
             }
         }
 
-        Ok(Self { inner: engine })
+        Ok(Self {
+            inner: engine,
+            workers_rx: None,
+            workers: vec![],
+            env_version: 0,
+            js_channel: cx.channel(),
+        })
     }
 }
 
 type BoxedJinjaEngine = JsBox<RefCell<JinjaEngine>>;
 
 impl JinjaEngine {
-    fn render_template(mut cx: FunctionContext) -> JsResult<JsString> {
+    fn render_template(mut cx: FunctionContext) -> JsResult<JsPromise> {
         #[cfg(build = "debug")]
         trace!("JinjaEngine.render_template");
 
@@ -195,16 +289,6 @@ impl JinjaEngine {
         let template_name = cx.argument::<JsString>(0)?;
         let template_compile_context = CLRepr::from_js_ref(cx.argument::<JsValue>(1)?, &mut cx)?;
         let template_python_context = CLRepr::from_js_ref(cx.argument::<JsValue>(2)?, &mut cx)?;
-
-        let engine = &this.borrow().inner;
-        let template = match engine.get_template(&template_name.value(&mut cx)) {
-            Ok(t) => t,
-            Err(err) => {
-                trace!("jinja get template error: {:?}", err);
-
-                return cx.throw_from_mj_error(err);
-            }
-        };
 
         let mut to_jinja_ctx = CLReprObject::new();
         to_jinja_ctx.insert("COMPILE_CONTEXT".to_string(), template_compile_context);
@@ -217,15 +301,17 @@ impl JinjaEngine {
             }
         }
 
-        let compile_context = to_minijinja_value(CLRepr::Object(to_jinja_ctx));
-        match template.render(compile_context) {
-            Ok(r) => Ok(cx.string(r)),
-            Err(err) => {
-                trace!("jinja render template error: {:?}", err);
+        let (deferred, promise) = cx.promise();
+        let channel = cx.channel();
 
-                cx.throw_from_mj_error(err)
-            }
-        }
+        let mut this = this.borrow_mut();
+        this.render(JinjaEngineWorkerJob::Render {
+            template_name: template_name.value(&mut cx),
+            ctx: to_minijinja_value(CLRepr::Object(to_jinja_ctx)),
+            deferred,
+        });
+
+        Ok(promise)
     }
 
     fn load_template(mut cx: FunctionContext) -> JsResult<JsUndefined> {
@@ -239,14 +325,20 @@ impl JinjaEngine {
         let template_name = cx.argument::<JsString>(0)?;
         let template_content = cx.argument::<JsString>(1)?;
 
-        if let Err(err) = this.borrow_mut().inner.add_template_owned(
+        let mut borrowed = this.borrow_mut();
+
+        if let Err(err) = borrowed.inner.add_template_owned(
             template_name.value(&mut cx),
             template_content.value(&mut cx),
         ) {
             trace!("jinja load error: {:?}", err);
 
             return cx.throw_from_mj_error(err);
-        }
+        };
+
+        borrowed.env_version += 1;
+        borrowed.workers = vec![];
+        borrowed.workers_rx = None;
 
         Ok(cx.undefined())
     }

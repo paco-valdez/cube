@@ -35,7 +35,7 @@ async function loadPythonCtxFromUtils(fileName: string) {
 function testTemplateBySnapshot(init: InitJinjaFn, templateName: string, ctx: unknown) {
   test(`render ${templateName}`, async () => {
     const { jinjaEngine } = await init();
-    const actual = jinjaEngine.renderTemplate(templateName, ctx, null);
+    const actual = await jinjaEngine.renderTemplate(templateName, ctx, null);
 
     expect(actual).toMatchSnapshot(templateName);
   });
